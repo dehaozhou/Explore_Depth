@@ -1,4 +1,4 @@
-# Exploring the Role of Depth Information in RS Tasks
+# Exploring the Role of Depth Information in Diverse Remote Sensing Semantic Segmentation Tasks
 
 ## Installation
 To set up the environment, please follow these steps:
