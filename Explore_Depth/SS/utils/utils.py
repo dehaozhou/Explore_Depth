@@ -428,78 +428,15 @@ def color_map(dataset='GID-15'):
 
 
 
-# class Depth_slobal_power(nn.Module):
-#     def __init__(self, max_weight=5.0, epsilon=1e-8):
-#         super(Depth_slobal_power, self).__init__()
-#         self.max_weight = max_weight
-#         self.epsilon = epsilon
-#         sobel_kernel_x = torch.tensor([[-1, 0, 1],
-#                                        [-2, 0, 2],
-#                                        [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-#         sobel_kernel_y = torch.tensor([[-1, -2, -1],
-#                                        [0, 0, 0],
-#                                        [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-#         self.sobel_kernel_x = nn.Parameter(sobel_kernel_x, requires_grad=False)
-#         self.sobel_kernel_y = nn.Parameter(sobel_kernel_y, requires_grad=False)
-#         laplacian_kernel = torch.tensor([[0, 1, 0],
-#                                          [1, -4, 1],
-#                                          [0, 1, 0]], dtype=torch.float32).view(1, 1, 3, 3)
-#         self.laplacian_kernel = nn.Parameter(laplacian_kernel, requires_grad=False)
-#     def forward(self, depth):
-#         if depth.dim() == 4 and depth.size(1) == 3:
-#             depth = depth.mean(dim=1, keepdim=True)
-#         elif depth.dim() == 3:
-#             depth = depth.unsqueeze(1)
-#         depth_normalized = depth
-#         depth_min = depth.view(depth.size(0), -1).min(dim=1, keepdim=True)[0].view(-1, 1, 1, 1)
-#         depth_max = depth.view(depth.size(0), -1).max(dim=1, keepdim=True)[0].view(-1, 1, 1, 1)
-#         depth_normalized = (depth - depth_min) / (depth_max - depth_min + self.epsilon)  # [B, 1, H, W]
-#         depth_padded = F.pad(depth_normalized, (1, 1, 1, 1), mode='reflect')
-#         grad_x = F.conv2d(depth_padded, self.sobel_kernel_x.to(depth.device))
-#         grad_y = F.conv2d(depth_padded, self.sobel_kernel_y.to(depth.device))
-#         depth_grad_first_order = torch.sqrt(grad_x ** 2 + grad_y ** 2 + self.epsilon)
-#         depth_laplacian = F.conv2d(depth_padded, self.laplacian_kernel.to(depth.device))
-#         depth_grad_second_order = torch.abs(depth_laplacian)
-#         scales = [1, 0.75, 0.5, 0.25]
-#         depth_grad_multiscale = depth_grad_first_order.clone()
-#         depth_grad_second_multiscale = depth_grad_second_order.clone()
-#         for scale in scales[1:]:
-#             depth_scaled = F.interpolate(depth_normalized, scale_factor=scale, mode='bilinear', align_corners=True)
-#             depth_padded_scaled = F.pad(depth_scaled, (1, 1, 1, 1), mode='reflect')
-#             grad_x_scaled = F.conv2d(depth_padded_scaled, self.sobel_kernel_x.to(depth.device))
-#             grad_y_scaled = F.conv2d(depth_padded_scaled, self.sobel_kernel_y.to(depth.device))
-#             grad_first_order_scaled = torch.sqrt(grad_x_scaled ** 2 + grad_y_scaled ** 2 + self.epsilon)
-#             grad_first_order_scaled = F.interpolate(grad_first_order_scaled, size=depth.size()[2:], mode='bilinear', align_corners=True)
-#             depth_grad_multiscale += grad_first_order_scaled
-#             laplacian_scaled = F.conv2d(depth_padded_scaled, self.laplacian_kernel.to(depth.device))
-#             grad_second_order_scaled = torch.abs(laplacian_scaled)
-#             grad_second_order_scaled = F.interpolate(grad_second_order_scaled, size=depth.size()[2:], mode='bilinear', align_corners=True)
-#             depth_grad_second_multiscale += grad_second_order_scaled
-#         depth_grad_multiscale = depth_grad_multiscale / len(scales)
-#         depth_grad_second_multiscale = depth_grad_second_multiscale / len(scales)
-#         combined_grad = depth_grad_multiscale + depth_grad_second_multiscale
-#         grad_min = combined_grad.view(depth.size(0), -1).min(dim=1, keepdim=True)[0].view(-1, 1, 1, 1)
-#         grad_max = combined_grad.view(depth.size(0), -1).max(dim=1, keepdim=True)[0].view(-1, 1, 1, 1)
-#         combined_grad_normalized = (combined_grad - grad_min) / (grad_max - grad_min + self.epsilon)
-#         weight_map = 1 + self.max_weight * torch.tanh(combined_grad_normalized)
-#         weight_map = weight_map.squeeze(1)
-#         return weight_map
-
-
-
 class Depth_MoE(nn.Module):
     def __init__(self, num_classes, embed_dim=64, num_heads=4, num_experts=4, hidden_dim=None):
         super(Depth_MoE, self).__init__()
         if hidden_dim is None:
-            hidden_dim = embed_dim * 2  # 前馈层隐藏维度, 默认为 embed_dim 的2倍
+            hidden_dim = embed_dim * 2
         self.embed_dim = embed_dim
-        # 输入通道 = 深度(1) + 语义类别概率(num_classes)
         self.in_channels = 1 + num_classes
-        # 1x1卷积: 将(depth, prob)拼接特征映射到 embed_dim 维度
         self.embedding = nn.Conv2d(self.in_channels, embed_dim, kernel_size=1)
-        # 多头自注意力层 (batch_first=True 以 [B,N,D] 输入)
         self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        # 专家网络列表: 每个专家是两层全连接的前馈网络
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(embed_dim, hidden_dim),
@@ -507,46 +444,31 @@ class Depth_MoE(nn.Module):
                 nn.Linear(hidden_dim, embed_dim)
             ) for _ in range(num_experts)
         ])
-        # 门控网络: 将特征映射到 num_experts 维度以产生每个专家的权重
         self.gating = nn.Linear(embed_dim, num_experts)
-        # 输出投影: 将最终特征映射到单通道权重
         self.out_proj = nn.Linear(embed_dim, 1)
-        # LayerNorm 层: 提高训练稳定性
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
     
     def forward(self, depth_map, prob_map):
-        """
-        depth_map: Tensor [B, 1, H, W], 单目深度图
-        prob_map:  Tensor [B, C, H, W], 语义预测 softmax 概率图
-        返回值:    Tensor [B, 1, H, W], 深度权重图
-        """
         B, _, H, W = depth_map.shape
-        # 1. 通道拼接深度与语义概率
         x = torch.cat([depth_map, prob_map], dim=1)  # [B, 1+C, H, W]
-        # 2. 嵌入: 1x1卷积将拼接特征转换到 embed_dim 通道
         x_embed = self.embedding(x)                 # [B, D, H, W]
         D = self.embed_dim
-        # 3. 展平: 将空间维度展平成长度N=H*W的序列
         N = H * W
         x_seq = x_embed.view(B, D, N).permute(0, 2, 1)  # [B, N, D]
-        # 4. 自注意力: 全局注意力融合特征 (预归一化 + 残差连接)
         x_norm = self.norm1(x_seq)
-        attn_out, _ = self.self_attn(x_norm, x_norm, x_norm)  # 自注意力计算
-        x_attended = x_seq + attn_out                         # 加残差
-        # 5. MoE前馈: 门控选择专家 (预归一化 + 专家加权求和 + 残差)
+        attn_out, _ = self.self_attn(x_norm, x_norm, x_norm)
+        x_attended = x_seq + attn_out
         x_norm2 = self.norm2(x_attended)
         gating_logits = self.gating(x_norm2)                  # [B, N, 4]
-        gating_weights = F.softmax(gating_logits, dim=-1)     # [B, N, 4], 对每个位置的4个专家权重
-        # 计算每个专家的输出
-        expert_outs = [expert(x_norm2) for expert in self.experts]    # 列表长度4, 每项 [B, N, D]
+        gating_weights = F.softmax(gating_logits, dim=-1)     # [B, N, 4]
+        expert_outs = [expert(x_norm2) for expert in self.experts]
         expert_outs = torch.stack(expert_outs, dim=2)                 # [B, N, 4, D]
-        combined_out = (expert_outs * gating_weights.unsqueeze(-1)).sum(dim=2)  # 按权重加权求和 [B, N, D]
+        combined_out = (expert_outs * gating_weights.unsqueeze(-1)).sum(dim=2)
         x_out = x_attended + combined_out                            # 加残差
-        # 6. 输出权重: 将特征映射为标量并重塑回图像
         weight_seq = self.out_proj(x_out)            # [B, N, 1]
         weight_map = weight_seq.view(B, 1, H, W)     # [B, 1, H, W]
-        weight_map = torch.sigmoid(weight_map)       # 用Sigmoid压缩到 [0,1] 区间
+        weight_map = torch.sigmoid(weight_map)
         return weight_map
 
 
