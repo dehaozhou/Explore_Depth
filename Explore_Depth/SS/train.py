@@ -2,7 +2,7 @@ from dataset.semi import SemiDataset
 from model.semseg.deeplabv2 import DeepLabV2
 from model.semseg.deeplabv3plus import DeepLabV3Plus
 from model.semseg.pspnet import PSPNet
-from utils_j.utils import *
+from utils.utils import *
 import argparse
 import numpy as np
 import os
@@ -17,22 +17,18 @@ from torch.optim import SGD
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from thop import profile, clever_format
+from thop import profile, clever_format
         
 seed = 1234
 set_random_seed(seed)
 
 DATASET = 'Vaihingen'     # ['Vaihingen','DFC22', , 'MER', 'Potsdam'] ,'MSL''Loveda'
 SPLIT = '1-8'     # ['1-4', '1-8', '100', '300']
+gate_history_l = []
+gate_history_u = []
 
-# finish:
-# DFC22: 1/4 1/8
-# Vaihingen 1/4 1/8
-# MER: 1/4 1/8
-#POTSDAM: 1/4 1/8
-# MSL:  1/4 1/8
-# Loveda 1/4
 
-DFC22_DATASET_PATH = '/data5/WMGS/dataset/splits/DFC22/'
+DFC22_DATASET_PATH = '/data5/dehaozhou/WMGS/dataset/splits/DFC22/'
 iSAID_DATASET_PATH = '/data5/WMGS/dataset/splits/iSAID/'
 MER_DATASET_PATH = '/data5/WMGS/dataset/splits/MER/'
 MSL_DATASET_PATH = '/data5/WMGS/dataset/splits/MSL/'
@@ -44,7 +40,7 @@ Loveda_DATASET_PATH = '/data5/WMGS/dataset/splits/Loveda/'
 
 PERCENT = 20
 LAMBDA = 1
-AUG_PROCESS_MODE = 'yes_seg_d_loss'
+AUG_PROCESS_MODE = 'Vaihingen'
 
 
 
@@ -73,7 +69,7 @@ def parse_args():
     # parser.add_argument('--depth_l-id-path', type=str, default='./dataset/splits/' + DATASET + '/' + SPLIT + '/depth_l.txt')
     # parser.add_argument('--sam_u-id-path', type=str, default='./dataset/splits/' + DATASET + '/' + SPLIT + '/sam_u.txt')
     # parser.add_argument('--sam_l-id-path', type=str, default='./dataset/splits/' + DATASET + '/' + SPLIT + '/sam_l.txt')
-    parser.add_argument('--save-path', type=str, default='./result_new/' + DATASET + '/' + SPLIT + '_' + str(PERCENT) + '_' + str(LAMBDA) + '/' + AUG_PROCESS_MODE)
+    parser.add_argument('--save-path', type=str, default='./exp/' + DATASET + '/' + SPLIT + '_' + str(PERCENT) + '_' + str(LAMBDA) + '/' + AUG_PROCESS_MODE)
 
     args = parser.parse_args()
     return args
@@ -114,7 +110,7 @@ def main(args):
     
     
 
-    model, optimizer = init_basic_elems(args)
+    model, optimizer,depth_weight_map_generator = init_basic_elems(args)
     print('\nParams: %.1fM' % count_params(model))
 
     # input_tensor = torch.randn(1, 3, args.crop_size, args.crop_size).cuda()  # 创建一个虚拟输入张量
@@ -124,8 +120,7 @@ def main(args):
     #     flops, params = clever_format([flops, params], "%.3f")
     #     print(f"FLOPs: {flops}, Params: {params}")
 
-    train(model, trainloader_l, trainloader_u, valloader, criterion, optimizer, args)
-
+    train(model, trainloader_l, trainloader_u, valloader, criterion, optimizer, args,depth_weight_map_generator)
 
 
 
@@ -142,13 +137,28 @@ def init_basic_elems(args):
                                  if 'backbone' not in name],
                       'lr': args.lr * head_lr_multiple}],
                     lr=args.lr, momentum=0.9, weight_decay=1e-4)
-    #model = DataParallel(model).cuda() #多线程
-    model = model.cuda(0) #单卡
 
-    return model, optimizer
+    # 创建 Depth_MoE 实例并添加到优化器中
+    depth_weight_map_generator = Depth_MoE().cuda()
+    optimizer.add_param_group({
+        'params': depth_weight_map_generator.parameters(),
+        'lr': args.lr*0.05  # 初始学习率比主网络大
+    })
+
+    model = model.cuda(0)
+
+    input_tensor = torch.randn(1, 3, args.crop_size, args.crop_size).cuda()  # 创建一个虚拟输入张量
+    model.eval()  # 切换到评估模式
+    with torch.no_grad():
+        flops, params = profile(model, inputs=(input_tensor,), verbose=False)
+        flops, params = clever_format([flops, params], "%.3f")
+        print(f"FLOPs: {flops}, Params: {params}")
+
+    return model, optimizer, depth_weight_map_generator  # 返回 depth_weight_map_generator
 
 
-def train(model, trainloader_l, trainloader_u, valloader, criterion, optimizer, args):
+
+def train(model, trainloader_l, trainloader_u, valloader, criterion, optimizer, args,depth_weight_map_generator):
     # 初始化训练参数
     iters = 0
     total_iters = len(trainloader_u) * args.epochs
@@ -161,8 +171,6 @@ def train(model, trainloader_l, trainloader_u, valloader, criterion, optimizer, 
 
     criterion_depth = Depth(lambda_seg_depth=1, lambda_smooth=0.5).cuda()
 
-
-    depth_weight_map_generator = Depth_MoE(max_weight=3).cuda()
 
     WEIGHTS = torch.ones(N_CLASSES).cuda()
 
@@ -187,7 +195,7 @@ def train(model, trainloader_l, trainloader_u, valloader, criterion, optimizer, 
 
 
 
-            rand_num = np.random.uniform(0, 1)  
+            rand_num = np.random.uniform(0, 1) 
             if rand_num < 0.5:
                 conf_u_w, mask_u_w, img_u_s1,  depth_u, sam_u = generate_depth_sam(conf_u_w, mask_u_w, img_u_s1,
                                                                                           img_u_s2, depth_u,
@@ -203,8 +211,10 @@ def train(model, trainloader_l, trainloader_u, valloader, criterion, optimizer, 
             loss_u = criterion(pred_u_s, mask_u_w)
             loss_u = loss_u * (em_u_s <= em_threshold)
             loss_u = torch.mean(loss_u)
-            weight_map_l = depth_weight_map_generator(depth_l,pred_l)  
-            weight_map_u = depth_weight_map_generator(depth_u,pred_u_s)
+            weight_map_l,gate_l = depth_weight_map_generator(depth_l,pred_l)  
+            weight_map_u,gate_u = depth_weight_map_generator(depth_u,pred_u_s)
+            gate_history_l.append(gate_l.detach().cpu().numpy())
+            gate_history_u.append(gate_u.detach().cpu().numpy())
             loss_depth_u = criterion_depth(pred_u_s, mask_u_w, depth_u, img_u_s1,WEIGHTS,weight_map_u)
             loss_depth_l = criterion_depth(pred_l, mask_l, depth_l, img_l,WEIGHTS,weight_map_l)
             weight_s = 1
