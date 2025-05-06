@@ -427,49 +427,87 @@ def color_map(dataset='GID-15'):
     return cmap
 
 
-
 class Depth_MoE(nn.Module):
-    def __init__(self, num_classes, embed_dim=64, num_heads=4, num_experts=4, hidden_dim=None):
-        super(Depth_MoE, self).__init__()
-        if hidden_dim is None:
-            hidden_dim = embed_dim * 2
+    """重构后的 Depth MoE，用于生成深度加权图，同时输出专家门控权重"""
+    def __init__(self, win=3, embed_dim=16, num_heads=2):
+        super().__init__()
+        self.win = win
         self.embed_dim = embed_dim
-        self.in_channels = 1 + num_classes
-        self.embedding = nn.Conv2d(self.in_channels, embed_dim, kernel_size=1)
-        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(embed_dim, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, embed_dim)
-            ) for _ in range(num_experts)
-        ])
-        self.gating = nn.Linear(embed_dim, num_experts)
-        self.out_proj = nn.Linear(embed_dim, 1)
+        self.depth_proj = nn.Linear(1, embed_dim)
+        self.semantic_proj = nn.Linear(1, embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
         self.norm1 = nn.LayerNorm(embed_dim)
+        def make_expert():
+            return nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+        self.expert_geo    = make_expert()
+        self.expert_sem    = make_expert()
+        self.expert_fusion = make_expert()
         self.norm2 = nn.LayerNorm(embed_dim)
-    
-    def forward(self, depth_map, prob_map):
-        B, _, H, W = depth_map.shape
-        x = torch.cat([depth_map, prob_map], dim=1)  # [B, 1+C, H, W]
-        x_embed = self.embedding(x)                 # [B, D, H, W]
-        D = self.embed_dim
-        N = H * W
-        x_seq = x_embed.view(B, D, N).permute(0, 2, 1)  # [B, N, D]
-        x_norm = self.norm1(x_seq)
-        attn_out, _ = self.self_attn(x_norm, x_norm, x_norm)
-        x_attended = x_seq + attn_out
-        x_norm2 = self.norm2(x_attended)
-        gating_logits = self.gating(x_norm2)                  # [B, N, 4]
-        gating_weights = F.softmax(gating_logits, dim=-1)     # [B, N, 4]
-        expert_outs = [expert(x_norm2) for expert in self.experts]
-        expert_outs = torch.stack(expert_outs, dim=2)                 # [B, N, 4, D]
-        combined_out = (expert_outs * gating_weights.unsqueeze(-1)).sum(dim=2)
-        x_out = x_attended + combined_out                            # 加残差
-        weight_seq = self.out_proj(x_out)            # [B, N, 1]
-        weight_map = weight_seq.view(B, 1, H, W)     # [B, 1, H, W]
-        weight_map = torch.sigmoid(weight_map)
-        return weight_map
+        self.gate = nn.Sequential(
+            nn.Linear(embed_dim * 3, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, 3),
+            nn.Softmax(dim=-1)
+        )
+        self.proj_out = nn.Linear(embed_dim, 1)
+
+        # init.xavier_uniform_(self.expert_geo[0].weight)
+        # init.xavier_uniform_(self.expert_sem[0].weight)
+        # init.xavier_uniform_(self.expert_fusion[0].weight)
+
+    def forward(self, depth, semantic_pred):
+        if depth.dim() == 3:
+            depth = depth.unsqueeze(1)
+        sem_prob = semantic_pred.softmax(dim=1).max(dim=1, keepdim=True).values
+        B, _, H, W = depth.shape
+        depth = (depth - depth.mean(dim=[2,3], keepdim=True)) \
+                / (depth.std(dim=[2,3], keepdim=True) + 1e-6)
+        sem_prob = (sem_prob - sem_prob.mean(dim=[2,3], keepdim=True)) \
+                   / (sem_prob.std(dim=[2,3], keepdim=True) + 1e-6)
+        depth = depth.detach()
+        depth_patch = einops.rearrange(
+            depth, 'b 1 (h w1) (w w2) -> (b h w) (w1 w2) 1',
+            w1=self.win, w2=self.win
+        )
+        sem_patch   = einops.rearrange(
+            sem_prob, 'b 1 (h w1) (w w2) -> (b h w) (w1 w2) 1',
+            w1=self.win, w2=self.win
+        )
+        depth_feat = self.depth_proj(depth_patch)    # [N, win*win, D]
+        sem_feat   = self.semantic_proj(sem_patch)   # [N, win*win, D]
+        x = depth_feat + sem_feat                    # [N,win*win,D]
+        x = self.norm1(x)
+        attn_out, _ = self.attn(x, x, x)             # [N,win*win,D]
+        x = self.norm1(x + attn_out)
+        geo_in    = x + depth_feat
+        sem_in    = x + sem_feat
+        fusion_in = x + depth_feat + sem_feat
+        o_geo    = geo_in    + self.expert_geo(geo_in)
+        o_sem    = sem_in    + self.expert_sem(sem_in)
+        o_fusion = fusion_in + self.expert_fusion(fusion_in)
+        expert_outputs = torch.stack([o_geo, o_sem, o_fusion], dim=-1)
+        mean_stat = x.mean(dim=1)        # [N, D]
+        max_stat  = x.max(dim=1).values  # [N, D]
+        std_stat  = x.std(dim=1)         # [N, D]
+        stats = torch.cat([mean_stat, max_stat, std_stat], dim=-1)  # [N,3D]
+        gate_w = self.gate(stats)        # [N, 3]
+        avg_gate = gate_w.mean(dim=0)    # [3]
+        gate_w = gate_w.unsqueeze(1).unsqueeze(2)  # [N,1,1,3]
+        moe = (expert_outputs * gate_w).sum(dim=-1)  # [N, win*win, D]
+        moe = self.norm2(moe + x)                    # 残差 + 归一化
+        y = torch.sigmoid(self.proj_out(moe))       # [N,win*win,1]
+        weight_map = einops.rearrange(
+            y, '(b h w) (w1 w2) 1 -> b 1 (h w1) (w w2)',
+            b=B, h=H//self.win, w=W//self.win, w1=self.win, w2=self.win
+        )
+        return weight_map.squeeze(1), avg_gate
+
+
+
 
 
 def loss_calc(pred, label, weights, weight_map=None):
